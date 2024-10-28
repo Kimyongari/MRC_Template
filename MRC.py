@@ -1,21 +1,35 @@
 import transformers
-from transformers import default_data_collator, TrainingArguments, EvalPrediction, Seq2SeqTrainingArguments, Seq2SeqTrainer
+from transformers import default_data_collator, TrainingArguments, EvalPrediction, Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorWithPadding
 from trainer_qa import QuestionAnsweringTrainer
 from utils_qa import postprocess_qa_predictions
 from arguments import Extraction_based_MRC_arguments, Generation_based_MRC_arguments
 from All_dataset import prepare_dataset
 from transformers import DataCollatorForSeq2Seq
 import wandb
-from datasets import load_metric
+from datasets import load_metric, concatenate_datasets, Dataset
 import os
+from glob import glob
 import numpy as np
 import nltk
 import pandas as pd
+import torch
+from sklearn.model_selection import KFold
 nltk.download('punkt')
 import warnings
 warnings.filterwarnings('ignore')
 from tqdm import tqdm
 import json
+
+class CustomDataCollatorWithPadding(DataCollatorWithPadding):
+    def __call__(self, features):
+        # 'offset_mapping'과 'overflow_to_sample_mapping' 필드를 제거
+        features = [
+            {k: v for k, v in feature.items() if k not in ['offset_mapping', 'overflow_to_sample_mapping']}
+            for feature in features
+        ]
+        return super().__call__(features)
+    
+    
 
 class Extraction_based_MRC:
     def __init__(self):
@@ -23,19 +37,57 @@ class Extraction_based_MRC:
         self.config = transformers.AutoConfig.from_pretrained(self.args.model_name)
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.model_name)
         self.model = transformers.AutoModelForQuestionAnswering.from_pretrained(self.args.model_name,
-                                                            config = self.config, trust_remote_code = True)
+                                                            config = self.config,
+                                                             trust_remote_code = True)
         self.datas = prepare_dataset(self.args)
         self.datasets = self.datas.get_pure_dataset()
-        self.train_dataset = self.datas.get_mrc_train_dataset()
-        self.eval_dataset = self.datas.get_mrc_eval_dataset()
         self.metric = load_metric("squad")
         self.trainer = None
-
+        self.output_dir = self.args.model_path + '_' + self.args.model_name.split('/')[-1] # 모델 이름을 바탕으로 저장 경로가 생성됩니다.
         if self.args.use_wandb:
             self.start_wandb()
+            
+
+    def load_model(self):
+        
+        self.training_args = TrainingArguments(
+            output_dir = self.output_dir,
+            do_train = False,
+            do_eval = True,
+            per_device_eval_batch_size = self.args.per_device_eval_batch_size,  
+            fp16 = True
+        )
+        model_path = self.output_dir
+        print(model_path)
+        
+        checkpoints = sorted(glob(model_path + '/checkpoint-*'), key=lambda x: int(x.split('-')[-1]), reverse=True)
+        lastcheckpt = checkpoints[0]
+     
+        trainer_state_file = os.path.join(lastcheckpt, 'trainer_state.json')
+        print('제일 마지막 checkpoint :',trainer_state_file)
+        if os.path.exists(trainer_state_file):
+            with open(trainer_state_file, 'r') as f:
+                trainer_state = json.load(f)
+                best_checkpoint = trainer_state.get('best_model_checkpoint', None)
+                print('best checkpoint :', best_checkpoint)
+ 
+        
+        # best model checkpoint 경로 가져오기
+        best_checkpoint = trainer_state.get('best_model_checkpoint', None)
+        self.config = transformers.AutoConfig.from_pretrained(best_checkpoint)
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(best_checkpoint)
+        self.model = transformers.AutoModelForQuestionAnswering.from_pretrained(best_checkpoint, config=self.config)
+        # Trainer 인스턴스 생성
+        self.trainer = QuestionAnsweringTrainer(
+            model = self.model,
+            args = self.training_args,
+            post_process_function = self.post_processing_function,
+            compute_metrics = self.compute_metrics
+        )
+        print("bestmodel 체크포인트로 모델과 Trainer가 로드되었습니다.")
 
     def post_processing_function(self, examples, features, predictions, training_args):
-        # Post-processing: we match the start logits and end logits to answers in the original context.
+        # 모델의 output을 바탕으로 단어를 예측합니다. (model > trainer > post_processing_function > util_qa.py에 있는 postprocess_qa_predictions)
         predictions = postprocess_qa_predictions(
             examples = examples,
             features = features,
@@ -44,24 +96,29 @@ class Extraction_based_MRC:
             n_best_size = self.args.n_best_size,
             max_answer_length = self.args.max_answer_length,
             null_score_diff_threshold = 0.0,
-            output_dir = self.args.output_dir,
+            output_dir = self.output_dir,
             is_world_process_zero = self.trainer.is_world_process_zero(),
         )
         
-        # Format the result to the format the metric expects.
         formatted_predictions = [{"id": k, "prediction_text": v} for k, v in predictions.items()]
-        references = [{"id": ex["id"], "answers": ex["answers"]} for ex in self.datasets["validation"]]
-        return EvalPrediction(predictions=formatted_predictions, label_ids=references)
+        print(examples)
+        if training_args.do_predict:
+            return formatted_predictions
+        elif training_args.do_eval:
+            references = [
+                {"id": ex["id"], "answers": ex['answers']}
+                for ex in examples
+            ]
+
+            return EvalPrediction(
+                predictions=formatted_predictions, label_ids=references
+            )
     
-    def compute_metrics(self, p: EvalPrediction):
-        return self.metric.compute(predictions = p.predictions, references = p.label_ids)
-    
-    def train(self):
+    def get_trainer(self, train_dataset = None, eval_dataset = None):
         self.training_args = TrainingArguments(
-            output_dir= self.args.output_dir,
-            do_train = True, 
-            do_eval = True, 
+            output_dir = self.output_dir,
             learning_rate = 3e-5,
+            gradient_accumulation_steps=1,
             per_device_train_batch_size = self.args.per_device_train_batch_size,
             per_device_eval_batch_size = self.args.per_device_train_batch_size,
             num_train_epochs = self.args.num_train_epochs,
@@ -72,15 +129,22 @@ class Extraction_based_MRC:
             run_name = f"Extraction_MRC_{self.args.model_name}",  # wandb run name 설정
             logging_dir='./logs',  # 로그 저장 경로
             logging_strategy = "epoch",
+            load_best_model_at_end = True,
+            fp16 = True
         )
+
+        data_collator = DataCollatorWithPadding(
+            self.tokenizer, pad_to_multiple_of=8 if self.training_args.fp16 else None
+        )
+
         self.trainer = QuestionAnsweringTrainer(
                 model = self.model,
                 args = self.training_args,
-                train_dataset = self.train_dataset,
-                eval_dataset = self.eval_dataset,
+                train_dataset = train_dataset,
+                eval_dataset = eval_dataset,
                 eval_examples = self.datasets["validation"],
                 tokenizer = self.tokenizer,
-                data_collator = default_data_collator,
+                data_collator = data_collator,
                 post_process_function = self.post_processing_function,
                 compute_metrics = self.compute_metrics,
             )
@@ -88,8 +152,64 @@ class Extraction_based_MRC:
         if self.args.use_wandb:
             self.training_args.report_to = ["wandb"]
             self.training_args.run_name = "default"
+    
+            
+    def compute_metrics(self, p: EvalPrediction):
+        return self.metric.compute(predictions = p.predictions, references = p.label_ids)
+            
+    def train(self, train_dataset = None, eval_dataset = None):
+        self.get_trainer()
+        if train_dataset == None:
+            train_dataset = self.datas.get_mrc_train_dataset()
+            print('train_dataset을 넣지 않아 기존에 주어진 train dataset으로 학습합니다.')
+        else:
+            train_dataset = self.datas.get_mrc_train_dataset(train_dataset)
 
+        if eval_dataset == None:
+            eval_dataset = self.datas.get_mrc_eval_dataset() 
+            print('eval_dataset을 넣지 않아 기존에 주어진 eval_dataset으로 평가합니다.')
+        else:
+            eval_dataset = self.datas.get_mrc_eval_dataset(eval_dataset)
+
+        self.trainer.train_dataset = train_dataset
+        self.trainer.eval_dataset = eval_dataset
         self.trainer.train()
+        
+        torch.cuda.empty_cache()
+        
+
+    def kfold_train(self, train_dataset = None, eval_dataset = None):
+        output_dir = self.output_dir + '_kfold'
+        self.training_args.output_dir = output_dir
+
+
+        if train_dataset == None and eval_dataset == None:
+            print('train_dataset을 넣지 않아 기존에 주어진 train dataset으로 학습합니다.')
+            print('eval_dataset을 넣지 않아 기존에 주어진 eval_dataset으로 평가합니다.')
+            train_dataset, eval_dataset = self.datasets['train'], self.datasets['validation']
+            concat_data = concatenate_datasets([train_dataset, eval_dataset])
+        else:
+            concat_data = concatenate_datasets([train_dataset, eval_dataset])
+
+        kf = KFold(n_splits = self.args.kfold, shuffle = True, random_state = 42,)
+        self.get_trainer()
+        self.training_args.num_train_epochs = self.args.epoch_for_kfold
+
+        for fold, (train_idx, eval_idx) in enumerate(kf.split(concat_data)):
+            print(f'--------------{fold+1} fold ----------------')
+            train = Dataset.from_dict(concat_data[train_idx])
+            eval = Dataset.from_dict(concat_data[eval_idx])
+            eval_examples = eval
+            self.trainer.train_dataset = self.datas.get_mrc_train_dataset(train)
+            self.trainer.eval_dataset = self.datas.get_mrc_eval_dataset(eval)
+            self.trainer.eval_examples = eval_examples
+            print(eval_examples)
+            print(self.datas.get_mrc_eval_dataset(eval))
+            self.model.resize_token_embeddings(len(self.tokenizer))
+
+            self.trainer.train()
+        
+        torch.cuda.empty_cache()
 
     def start_wandb(self):
         os.system("rm -rf /root/.cache/wandb")
@@ -98,44 +218,19 @@ class Extraction_based_MRC:
         
         # WandB API 키 설정 (여러분의 API 키를 넣어주시면 됩니다)
         os.environ["WANDB_API_KEY"] = self.args.wandb_key
-        wandb.init(project='Dense_embedding_retrieval')
+        wandb.init(project = 'Dense_embedding_retrieval')
 
     def inference(self, test_dataset):
-        eval_dataset, eval_examples = self.datas.get_mrc_test_dataset(test_dataset)
-        eval_dataset = eval_dataset['validation']
-        if not self.trainer:
-            self.training_args = TrainingArguments(
-            output_dir = self.args.output_dir,
-            do_train = True, 
-            do_eval = True, 
-            learning_rate = 3e-5,
-            per_device_train_batch_size = self.args.per_device_train_batch_size,
-            per_device_eval_batch_size = self.args.per_device_train_batch_size,
-            num_train_epochs = self.args.num_train_epochs,
-            weight_decay = 0.01,
-            evaluation_strategy = "epoch",
-        )
-
-        self.trainer = QuestionAnsweringTrainer(
-            model = self.model,
-            args = self.training_args,
-            train_dataset = self.train_dataset,
-            eval_dataset = self.eval_dataset,
-            eval_examples = self.datasets["validation"],
-            tokenizer = self.tokenizer,
-            data_collator = default_data_collator,
-            post_process_function = self.post_processing_function,
-            compute_metrics = self.compute_metrics,
-            )
-        
+        assert self.trainer is not None, "trainer가 없습니다. 로드하거나 train하세요."
+        test_dataset, test_examples = self.datas.get_mrc_test_dataset(test_dataset)
+        self.training_args.do_predict = True
         predictions = self.trainer.predict(
-            test_dataset = eval_dataset,
-            test_examples = eval_examples)        
-        
+            test_dataset = test_dataset,
+            test_examples = test_examples)        
+
         print('output을 id : answers 형태의 json파일로 내보냅니다. 결과는 model.extraction_mrc_results로 확인할 수 있습니다.')
-        self.extraction_mrc_results = pd.DataFrame({'id' : eval_examples['id'], 
-                                                    'answers' : [item['prediction_text'] for item in predictions.predictions]})
-        result_dict = self.extraction_mrc_results.set_index('id')['answers'].to_dict()
+        self.extraction_mrc_results = pd.DataFrame(predictions)
+        result_dict = self.extraction_mrc_results.set_index('id')['prediction_text'].to_dict()
         if not os.path.exists("predict_result"):
             os.makedirs("predict_result")
             print("폴더 'predict_result'가 생성되었습니다.")
@@ -156,6 +251,40 @@ class Generation_based_MRC:
         self.datasets = self.datas.get_pure_dataset()
         if self.args.use_wandb:
             self.start_wandb()
+        self.output_dir = self.args.model_path + self.args.model_name.split('/')[-1] # 모델 이름을 바탕으로 저장 경로가 생성됩니다.
+
+    def load_model(self):
+        
+        self.training_args = TrainingArguments(
+            output_dir = self.output_dir,
+            do_train = False,
+            do_eval = True,
+            per_device_eval_batch_size = self.args.per_device_eval_batch_size,  
+        )
+        model_path = self.output_dir
+        lastcheckpt = glob(model_path + '/checkpoint-*')[-1]
+    
+        trainer_state_file = os.path.join(lastcheckpt, 'trainer_state.json')
+        print('제일 마지막 checkpoint :',trainer_state_file)
+        if os.path.exists(trainer_state_file):
+            with open(trainer_state_file, 'r') as f:
+                trainer_state = json.load(f)
+                best_checkpoint = trainer_state.get('best_model_checkpoint', None)
+                print('best checkpoint :', best_checkpoint)
+        
+        # best model checkpoint 경로 가져오기
+        best_checkpoint = trainer_state.get('best_model_checkpoint', None)
+        self.config = transformers.AutoConfig.from_pretrained(best_checkpoint)
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(best_checkpoint)
+        self.model = transformers.AutoModelForSeq2SeqLM.from_pretrained(best_checkpoint, config=self.config)
+        # Trainer 인스턴스 생성
+        self.trainer = Seq2SeqTrainer(
+            model = self.model,
+            args = self.training_args,
+            post_process_function = self.post_processing_function,
+            compute_metrics = self.compute_metrics
+        )
+        print("bestmodel 체크포인트로 모델과 Trainer가 로드되었습니다.")
 
     def postprocess_text(self, preds, labels):
         preds = [pred.strip() for pred in preds]
@@ -175,12 +304,10 @@ class Generation_based_MRC:
         # [14,42,512,41,125,643,-100,-100,-100]
         # > [14,42,512,31,125,643,패딩,패딩,패딩] 
         decoded_preds = self.tokenizer.batch_decode(preds, skip_special_tokens=True)
-        # decoded_labels is for rouge metric, not used for f1/em metric
 
         labels = np.where(labels != -100, labels, self.tokenizer.pad_token_id)
         decoded_labels = self.tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-        # Some simple post-processing
         decoded_preds, decoded_labels = self.postprocess_text(decoded_preds, decoded_labels)
 
         formatted_predictions = [{"id": ex['id'], "prediction_text": decoded_preds[i]} for i, ex in enumerate(self.datasets["validation"])]
@@ -206,10 +333,10 @@ class Generation_based_MRC:
             self.tokenizer,
             self.model,
             label_pad_token_id = self.tokenizer.pad_token_id,
-            pad_to_multiple_of = None,
+            pad_to_multiple_of = 8,
         )
         training_args = Seq2SeqTrainingArguments(
-            output_dir = './generative_MRC_outputs',
+            output_dir = self.output_dir,
             do_eval=True,
             per_device_train_batch_size = self.args.per_device_train_batch_size,
             per_device_eval_batch_size = self.args.per_device_train_batch_size,
@@ -223,7 +350,9 @@ class Generation_based_MRC:
             load_best_model_at_end = True,
             learning_rate = self.args.learning_rate,
             weight_decay = 0.01,
-            remove_unused_columns = True)
+            remove_unused_columns = True,
+            fp16 = True,
+            )
 
         if self.args.use_wandb:
             training_args.report_to = ["wandb"]
@@ -265,3 +394,4 @@ class Generation_based_MRC:
 
         with open(f"predict_result/Generative_mrc_output_{self.args.model_name.split('/')[-1]}.json", 'w', encoding='utf-8') as json_file:
             json.dump(result_dict, json_file, ensure_ascii=False, indent=4)
+            

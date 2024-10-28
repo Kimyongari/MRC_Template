@@ -38,9 +38,8 @@ class DenseDataset(torchDataset):
             'q_input_ids': self.q_input_ids[idx],
             'q_attention_mask': self.q_attention_mask[idx],
             'q_token_type_ids': self.q_token_type_ids[idx],
-            'labels' : self.labels[idx]
-        }
-    
+            'labels' : self.labels}
+        
 #  --------------------------MRC 모델을 학습하기 위한 mrc_dataset을 선언하는 부분입니다-----------------------------------------------------------
 
 
@@ -139,9 +138,11 @@ class prepare_dataset:
 
         return tokenized_examples
 
-    def get_mrc_train_dataset(self):
-        column_names = self.dataset["train"].column_names
-        train_dataset = self.dataset['train'].map(
+    def get_mrc_train_dataset(self, train_dataset = None):
+        if train_dataset == None:
+            train_dataset = self.dataset['train']
+        column_names = train_dataset.column_names
+        train_dataset = train_dataset.map(
             self.prepare_train_features,
             batched = True,
             num_proc = self.args.num_proc,
@@ -152,10 +153,16 @@ class prepare_dataset:
         # 각 샘플에서 'example_id'와 'offset_mapping' 제거
             example.pop("example_id", None)
             example.pop("offset_mapping", None)
+            if 'roberta' in self.args.model_name:
+                example.pop('token_type_ids', None)
             return example
 
             # 데이터셋에 일괄 적용
         train_dataset = train_dataset.map(remove_keys)
+        if 'roberta' in self.args.model_name:
+            print('roberta 모델이 발견되어 train dataset에서 token type ids를 삭제합니다')
+
+        
         return train_dataset
         
     def prepare_validation_features(self, examples):
@@ -167,6 +174,7 @@ class prepare_dataset:
             stride = self.args.doc_stride,
             return_overflowing_tokens = True,
             return_offsets_mapping = True,
+            return_token_type_ids = True,
             padding = "max_length",
         )
 
@@ -188,75 +196,71 @@ class prepare_dataset:
 
         return tokenized_examples
     
-    def get_mrc_eval_dataset(self):
-        column_names = self.dataset["validation"].column_names
-        eval_exmaples = self.dataset['validation']
-        eval_dataset = eval_exmaples.map(
-            self.prepare_train_features,
+    def get_mrc_eval_dataset(self, eval_dataset = None):
+        if eval_dataset == None:
+            eval_dataset = self.dataset['validation']
+        column_names = eval_dataset.column_names
+        eval_dataset = eval_dataset.map(
+            self.prepare_train_features, # epoch 도중 validation을 할 수 있도록 train함수로 매핑
             batched = True,
             num_proc = self.args.num_proc,
             remove_columns = column_names,
             load_from_cache_file = False,
         )
+        def remove_keys(example):
+            if 'roberta' in self.args.model_name:
+                example.pop('token_type_ids', None)
+            return example
+        
+        if 'roberta' in self.args.model_name.lower():
+            eval_dataset = eval_dataset.map(remove_keys)
+            print('roberta 모델이 발견되어 eval dataset에서 token type ids를 지웁니다.')
         return eval_dataset
     
+    
     def get_mrc_test_dataset(self, test_dataset):
-        column_names = test_dataset['validation'].column_names
-        eval_examples = test_dataset['validation']
-
-        eval_dataset = test_dataset.map(
+        if 'validation' in test_dataset.keys():
+            test_examples = test_dataset['validation']
+            column_names = test_dataset['validation'].column_names
+        else:
+            test_examples = test_dataset
+            column_names = test_dataset.column_names
+        test_dataset = test_dataset.map(
             self.prepare_validation_features,
             batched = True,
             num_proc = self.args.num_proc,
             remove_columns = column_names,
             load_from_cache_file = False,
         )
-        return eval_dataset, eval_examples
+        if 'validation' in test_dataset.keys():
+            test_dataset = test_dataset['validation']
+
+        def remove_keys(example):
+        # 각 샘플에서 'example_id'와 'offset_mapping' 제거
+            if 'roberta' in self.args.model_name:
+                example.pop('token_type_ids', None)
+            return example
+        if 'roberta' in self.args.model_name.lower():
+            test_dataset = test_dataset.map(remove_keys)
+            print('roberta 모델이 발견되어 test dataset에서 token type ids를 지웁니다.')
+
+        return test_dataset, test_examples
 
 # -----------------------------------Dense Embedding을 위한 데이터셋을 선언하는 부분입니다--------------------------------------------------------
+    def get_dense_dataset(self, mode = 'train'):
+        if mode == 'train':
+            training_dataset = self.dataset['train']
+        elif mode == 'valid':
+            training_dataset = self.dataset['validation']
 
+        p_tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.model_name)
+        q_tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.model_name)
 
-    def get_dense_train_dataset(self):
-        training_dataset = self.dataset['train']
-        num_neg = self.args.num_neg
-        p_with_neg = []  # 패시지(긍정 + 부정 예시) 저장 리스트
-        labels = []  # 정답 레이블 저장 리스트
-
-        # 위키 데이터 로드
-        with open(self.args.wiki_route, 'r', encoding='utf-8') as f:
-            wiki = json.load(f)
-
-        corpus = list(dict.fromkeys([v['text'] for v in wiki.values()]))
-
-        tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.model_name)
-
-        for context in training_dataset['context']:
-            while True:
-                neg_idxs = np.random.choice(len(corpus), size=num_neg, replace=False)  # 부정 예시 랜덤 선택
-                neg_samples = [corpus[i] for i in neg_idxs]
-
-                # 부정 예시에 긍정 예시인 context가 없을 경우
-                if context not in neg_samples:
-                    p_neg = neg_samples + [context]  # 부정 예시와 긍정 예시를 합침
-                    random.shuffle(p_neg)  # 긍정 예시와 부정 예시의 순서를 섞음
-
-                    context_index = p_neg.index(context)  # 섞인 리스트에서 긍정 예시의 위치 찾기
-                    labels.append(context_index)  # 위치를 정답 레이블에 추가
-                    p_with_neg.extend(p_neg)  # 섞인 리스트를 전체 패시지에 추가
-                    break  
-
-
-
-        q_seqs = tokenizer(training_dataset['question'], padding='max_length', 
+        q_seqs = q_tokenizer(training_dataset['question'], padding='max_length', 
                         truncation=True, return_tensors='pt')
-        p_seqs = tokenizer(p_with_neg, padding='max_length', truncation=True,
-                        return_tensors='pt')
-        max_len = p_seqs['input_ids'].size(-1)
-        
-        p_seqs['input_ids'] = p_seqs['input_ids'].view(-1, num_neg + 1, max_len)
-        p_seqs['attention_mask'] = p_seqs['attention_mask'].view(-1, num_neg + 1, max_len)
-        p_seqs['token_type_ids'] = p_seqs['token_type_ids'].view(-1, num_neg + 1, max_len)
-        
+        p_seqs = p_tokenizer(training_dataset['context'], padding='max_length', 
+                        truncation=True, return_tensors='pt')
+        labels = torch.arange(0, self.args.per_device_train_batch_size).long()
 
         train_dataset = DenseDataset(
             p_seqs['input_ids'],
@@ -269,63 +273,16 @@ class prepare_dataset:
         )
 
         return train_dataset
-
-            
-
-    def get_dense_valid_dataset(self):
-        validation_dataset = self.dataset['validation']
-        num_neg = self.args.num_neg
-        p_with_neg = []
-        labels = []
-        # 위키 데이터 로드
-        with open(self.args.wiki_route, 'r', encoding='utf-8') as f:
-            wiki = json.load(f)
-
-        corpus = list(dict.fromkeys([v['text'] for v in wiki.values()]))
-
-        tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.model_name)
-
-        for context in validation_dataset['context']:
-            while True:
-                neg_idxs = np.random.choice(len(corpus), size=num_neg, replace=False)  # 부정 예시 랜덤 선택
-                neg_samples = [corpus[i] for i in neg_idxs]
-
-                # 부정 예시에 긍정 예시인 context가 없을 경우
-                if context not in neg_samples:
-                    p_neg = neg_samples + [context]  # 부정 예시와 긍정 예시를 합침
-                    random.shuffle(p_neg)  # 긍정 예시와 부정 예시의 순서를 섞음
-
-                    context_index = p_neg.index(context)  # 섞인 리스트에서 긍정 예시의 위치 찾기
-                    labels.append(context_index)  # 위치를 정답 레이블에 추가
-                    p_with_neg.extend(p_neg)  # 섞인 리스트를 전체 패시지에 추가
-                    break  # 반복문 종료 (새로운 부정 예시 선택이 필요 없음)
-
-
-        q_seqs = tokenizer(validation_dataset['question'], padding='max_length', 
-                        truncation=True, return_tensors='pt')
-        p_seqs = tokenizer(p_with_neg, padding='max_length', truncation=True,
-                        return_tensors='pt')
-
-        max_len = p_seqs['input_ids'].size(-1)
-        p_seqs['input_ids'] = p_seqs['input_ids'].view(-1, num_neg + 1, max_len)
-        p_seqs['attention_mask'] = p_seqs['attention_mask'].view(-1, num_neg + 1, max_len)
-        p_seqs['token_type_ids'] = p_seqs['token_type_ids'].view(-1, num_neg + 1, max_len)
-
-        valid_dataset = DenseDataset(p_seqs['input_ids'], 
-                                      p_seqs['attention_mask'],
-                                      p_seqs['token_type_ids'],
-                                      q_seqs['input_ids'], 
-                                      q_seqs['attention_mask'],
-                                      q_seqs['token_type_ids'],
-                                      labels
-        )
-
-        return valid_dataset
     
-    def get_dense_queries_for_search(self):
-        test_dataset = load_from_disk(self.args.test_data_route)
-        query_vectors = self.tokenizer(test_dataset['validation']['question'], padding='max_length', 
+    def get_dense_queries_for_search(self, mode = 'test'):
+        q_tokenizer = transformers.AutoTokenizer.from_pretrained(self.args.model_name)
+        if mode == 'test':
+            test_dataset = load_from_disk(self.args.test_data_route)['validation']
+        elif mode == 'eval':
+            test_dataset = self.dataset['validation']
+        query_vectors = q_tokenizer(test_dataset['question'], padding='max_length', 
                         truncation=True, return_tensors='pt')
+        
         return test_dataset, query_vectors
 
     def get_context(self):
